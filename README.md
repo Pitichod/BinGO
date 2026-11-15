@@ -1,22 +1,25 @@
 # BinGo Smart Waste Sorter
 
-BinGo is a smart bin that photographs an item on its tray, classifies the waste, and drops it into the matching compartment using two servos. This README describes the current design draft.
+BinGo is a smart waste sorter. The prototype photographs items, classifies them with Ultralytics, and reports compartment clearance to Blynk. The sorting mechanism and three additional gateway sensors are planned for when the hardware arrives.
 
 ## System diagram
 
 ```mermaid
 flowchart LR
     sensor[Trash presence sensor] -->|Item detected on tray| node[ESP32 sensor node]
+    level[HC-SR04 per compartment] -->|Distance to trash| node
     node -->|Capture trigger| camera[ESP32-CAM with OV3660]
     camera -->|JPEG image| node
-    node -->|Forward JPEG| gateway[ESP32 gateway]
+    node -->|JPEG and compartment distances over UART| gateway[ESP32 gateway]
     gateway -->|Upload JPEG| ai[Ultralytics classification API]
     ai -->|Predicted waste class| gateway
-    gateway -->|Select bin compartment| servos[Two-servo sorting mechanism]
+    gateway -->|Compartment distances over HTTPS| dashboard[Blynk dashboard]
+    gatewaySensors[Load cell + HX711, DHT11, light sensor] -.->|Planned gateway sensors| gateway
+    gateway -.->|Planned AI-controlled sorting| servos[Two-servo sorting mechanism]
     servos -->|Rotate, then tilt| bin[Selected bin compartment]
 ```
 
-## Sorting sequence
+## Planned sorting sequence
 
 1. The presence sensor detects trash on the tray. The **ESP32 sensor node** tells the **ESP32-CAM** to take a picture.
 2. The **ESP32-CAM**, fitted with the **OV3660**, sends one JPEG back to the sensor node. The sensor node forwards the JPEG to the **ESP32 gateway**.
@@ -24,6 +27,17 @@ flowchart LR
 4. **Servo 1** rotates the tray over that compartment. **Servo 2** tilts the tray to drop the item.
 
 **Camera milestone:** Send one capture trigger from the sensor node and verify that it receives one complete, viewable JPEG from the ESP32-CAM.
+
+The current prototype uses the serial command `c` to trigger the camera and displays the AI classification on the gateway LCD. Once the hardware arrives, the gateway will use the predicted class to select a compartment and then command the two servos. The mechanism will need a safe stop, such as a timeout or a manual stop, for testing and demonstration.
+
+## Sensor allocation
+
+| Board | Sensor types | Status |
+| --- | --- | --- |
+| Sensor node | OV3660 camera via the ESP32-CAM, HC-SR04 ultrasonic distance | 2 types in use |
+| Gateway | Load cell with HX711, DHT11, light sensor | 3 types planned |
+
+The two HC-SR04 modules count as one sensor type. The planned configuration has five distinct types once the gateway reads and uses all three new sensors.
 
 ## Camera UART wiring
 
@@ -34,6 +48,33 @@ flowchart LR
 | GND | ↔ | GND | Common ground |
 
 Use the same baud rate on both boards. Start testing at `115200` baud. On an AI-Thinker ESP32-CAM, leave microSD disabled while using IO14 and IO13 for UART.
+
+## Compartment room sensors (HC-SR04)
+
+Mount one HC-SR04 above each trash compartment, pointing down with a clear path to the bottom. The two enabled sensors are numbered by physical compartment: connect bin 1 to the first GPIO pair and bin 2 to the second. For three or four compartments, wire the additional sensors and change `kBinCount` in `BinGoSensorNode.ino` to match.
+
+| Compartment | TRIG on sensor node | ECHO on sensor node (through divider) |
+| --- | --- | --- |
+| 1 | GPIO18 | GPIO34 |
+| 2 | GPIO19 | GPIO35 |
+| 3 (optional) | GPIO21 | GPIO36 (VP) |
+| 4 (optional) | GPIO22 | GPIO39 (VN) |
+
+Power each standard HC-SR04 from **5 V** and connect its GND to the sensor node's GND. Wire TRIG directly. Each 5 V ECHO output needs its **own voltage divider** before reaching the ESP32: connect HC-SR04 ECHO to one end of a **2.2 kΩ** resistor, connect the other end to the ESP32 ECHO GPIO, and connect a **3.3 kΩ** resistor from that GPIO to GND. The GPIO receives about 3 V when ECHO is high. See the [HC-SR04 datasheet](https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf) and [ESP32 datasheet](https://documentation.espressif.com/esp32_datasheet_en.html).
+
+1. Upload `BinGoSensorNode.ino`. Open the **sensor node** Serial Monitor at `115200` baud and send `f`. Each enabled sensor reports its clearance in cm. The node pings one sensor at a time to reduce interference.
+2. With the compartments empty, copy each stable clearance into the corresponding `emptyCm` field in `kBins` (the third value in each row). Set `fullCm` (the fourth value) to the distance from the sensor to the highest acceptable trash level; the starting value is 5 cm. Keep `2 ≤ fullCm < emptyCm ≤ 400`.
+3. Upload again and send `f`. An empty bin should read close to `100% room left`. Hold a flat target at the full line to check for close to `0%`, and try a point between the two. Unplug an ECHO lead on the sensor side of the divider to verify that the node reports `room unknown` for that bin while still reporting the other bins.
+
+Room left is an estimate of remaining **height** between the calibrated empty and full positions; uneven trash can change the reading. If the surface is too close or doesn't return a usable echo, the node reports an unknown reading. The sensor node prints readings to Serial Monitor and sends the distances to the gateway. The gateway LCD displays classification results.
+
+## Blynk distance dashboard
+
+1. In the **BinGo** template in Blynk.Console, use **Virtual Pin** datastreams **V0** for compartment 1 and **V1** for compartment 2. Check that both use type **Double**, unit **cm**, and range **2–400**. Add a value widget for each datastream to the Web Dashboard. Enable **Save RAW Data** in the datastream settings to retain individual readings. If compartments 3 and 4 are enabled on the sensor node, set up **V2** and **V3** for them.
+2. On the gateway, copy [BlynkSecrets.example.h](arduino/BinGoGateway/BlynkSecrets.example.h) to `BlynkSecrets.h`, set `BLYNK_AUTH_TOKEN` to the BinGo device's token, and check that `BLYNK_SERVER` matches the region shown in Blynk.Console. The gateway connects through its existing Wi-Fi settings in `Secrets.h`. The Blynk HTTPS API uses the device token, so it needs no Blynk Arduino library.
+3. Upload the gateway sketch first, then the sensor node sketch. The node sends the measured clearance in cm over UART every 30 seconds. To trigger a reading immediately, enter `f` in the sensor node's Serial Monitor. Look for `BLYNK OK HTTP 200` in the gateway's Serial Monitor, then move a target beneath a sensor and confirm that the corresponding dashboard value changes. Distances work before fill percentage calibration. A missed echo leaves that compartment's last valid value in Blynk.
+
+**If Blynk shows Offline while readings update:** The gateway sends each batch in a short HTTPS request and closes the connection after the upload. To make the status reflect recent readings, open **Blynk.Console → Developer Zone → My Templates → BinGo → Connection Lifecycle** and enable **Log when device reports any data**. Set the **Wait Period** to **90 seconds** to allow for delayed readings. Blynk shows the device as Online when it receives data and marks it Offline if no new data arrives within the wait period. [Blynk Connection Lifecycle](https://docs.blynk.io/en/blynk.console/templates/connection-lifecycle)
 
 ## ทดสอบกล้อง แฟลช และ Ultralytics API ใน Arduino IDE
 

@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <WiFi.h>
+#include <algorithm>
 #include <esp_rom_crc.h>
 
 #if __has_include("OtaSecrets.h")
@@ -19,8 +20,31 @@ constexpr int kGatewayRxPin = 33;
 constexpr int kGatewayTxPin = 32;
 constexpr unsigned int kTestWeightGrams = 42;
 
+struct BinSensor {
+  int trigPin;
+  int echoPin;
+  float emptyCm;
+  float fullCm;
+};
+
+constexpr size_t kBinCount = 2;
+constexpr BinSensor kBins[] = {
+    {18, 34, 0.0f, 5.0f},
+    {19, 35, 0.0f, 5.0f},
+    {21, 36, 0.0f, 5.0f},
+    {22, 39, 0.0f, 5.0f},
+};
+static_assert(kBinCount >= 2 && kBinCount <= sizeof(kBins) / sizeof(kBins[0]),
+              "Enable 2 to 4 bin sensors");
+constexpr unsigned long kEchoTimeoutUs = 25000;
+constexpr unsigned long kPingSpacingMs = 70;
+constexpr float kMinDistanceCm = 2.0f;
+constexpr float kMaxDistanceCm = 400.0f;
+constexpr unsigned long kDistanceReportIntervalMs = 30000;
+
 uint8_t jpeg[kMaxJpegBytes];
 bool otaStarted = false;
+unsigned long lastDistanceReportMs = 0;
 
 void setup() {
   Serial.begin(kBaud);
@@ -29,13 +53,66 @@ void setup() {
   Serial1.setTimeout(8000);
   Serial2.begin(kBaud, SERIAL_8N1, kGatewayRxPin, kGatewayTxPin);
   Serial2.setTimeout(2000);
-  Serial.println("NODE READY. Enter p to ping gateway or c to capture.");
+  for (size_t i = 0; i < kBinCount; ++i) {
+    pinMode(kBins[i].trigPin, OUTPUT);
+    digitalWrite(kBins[i].trigPin, LOW);
+    pinMode(kBins[i].echoPin, INPUT);
+  }
+  Serial.println("NODE READY. Enter p to ping gateway, c to capture, or f to measure bin room.");
 
   if (kOtaWifiSsid[0] != '\0' && kOtaPassword[0] != '\0') {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(kOtaWifiSsid, kOtaWifiPassword);
   }
+}
+
+float measureBinDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  const unsigned long echoUs = pulseIn(echoPin, HIGH, kEchoTimeoutUs);
+  // Give echoes time to die out before triggering this or another sensor.
+  delay(kPingSpacingMs);
+  return echoUs / 58.0f;
+}
+
+void reportBinRoom() {
+  lastDistanceReportMs = millis();
+  // Keep four UART fields; zero marks an unavailable or disabled sensor.
+  float distancesCm[4] = {};
+  for (size_t i = 0; i < kBinCount; ++i) {
+    const BinSensor &bin = kBins[i];
+    float samples[3];
+    size_t valid = 0;
+    for (size_t j = 0; j < sizeof(samples) / sizeof(samples[0]); ++j) {
+      const float cm = measureBinDistance(bin.trigPin, bin.echoPin);
+      if (cm >= kMinDistanceCm && cm <= kMaxDistanceCm) {
+        samples[valid++] = cm;
+      }
+    }
+
+    Serial.printf("BIN %u: ", static_cast<unsigned int>(i + 1));
+    if (valid < 2) {
+      Serial.println("room unknown (no reliable echo)");
+      continue;
+    }
+
+    std::sort(samples, samples + valid);
+    const float distanceCm = (samples[(valid - 1) / 2] + samples[valid / 2]) / 2.0f;
+    distancesCm[i] = distanceCm;
+    if (bin.fullCm < kMinDistanceCm || bin.emptyCm > kMaxDistanceCm ||
+        bin.emptyCm <= bin.fullCm) {
+      Serial.printf("%.1f cm clearance (calibration needed)\n", distanceCm);
+      continue;
+    }
+
+    const float remaining = 100.0f * (distanceCm - bin.fullCm) / (bin.emptyCm - bin.fullCm);
+    Serial.printf("%.0f%% room left (%.1f cm clearance)\n",
+                  constrain(remaining, 0.0f, 100.0f), distanceCm);
+  }
+  Serial2.printf("DIST %.2f %.2f %.2f %.2f\n",
+                 distancesCm[0], distancesCm[1], distancesCm[2], distancesCm[3]);
 }
 
 void captureAndForward() {
@@ -107,8 +184,15 @@ void loop() {
     case 'c':
       captureAndForward();
       break;
+    case 'f':
+      reportBinRoom();
+      break;
     default:
-      delay(1);
+      if (millis() - lastDistanceReportMs >= kDistanceReportIntervalMs) {
+        reportBinRoom();
+      } else {
+        delay(1);
+      }
       break;
   }
 }
