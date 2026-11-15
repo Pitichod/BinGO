@@ -39,6 +39,17 @@ The current prototype uses the serial command `c` to trigger the camera and disp
 
 The two HC-SR04 modules count as one sensor type. The planned configuration has five distinct types once the gateway reads and uses all three new sensors.
 
+## Reserved gateway pins for servos
+
+| Servo | Signal pin on the gateway ESP32 | Function |
+| --- | --- | --- |
+| Servo 1 | GPIO25 | Rotate the tray toward the selected compartment |
+| Servo 2 | GPIO26 | Tilt the tray to drop the item |
+
+GPIO25 and GPIO26 can output PWM and are available alongside the current UART and LCD pins. These assignments are for the gateway board. [ESP32 GPIO reference](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/gpio.html)
+
+Connect each servo's signal wire to its assigned GPIO. Use a separate regulated supply rated for the servo voltage and the combined current of both motors. Connect the servo grounds, supply ground, and gateway GND together. Check the servo's pinout and 3.3 V signal compatibility before wiring. Firmware control is planned.
+
 ## Camera UART wiring
 
 | ESP32 sensor node | Direction | ESP32-CAM | Purpose |
@@ -68,11 +79,12 @@ Power each standard HC-SR04 from **5 V** and connect its GND to the sensor node'
 
 Room left is an estimate of remaining **height** between the calibrated empty and full positions; uneven trash can change the reading. If the surface is too close or doesn't return a usable echo, the node reports an unknown reading. The sensor node prints readings to Serial Monitor and sends the distances to the gateway. The gateway LCD displays classification results.
 
-## Blynk distance dashboard
+## Blynk dashboard
 
 1. In the **BinGo** template in Blynk.Console, use **Virtual Pin** datastreams **V0** for compartment 1 and **V1** for compartment 2. Check that both use type **Double**, unit **cm**, and range **2–400**. Add a value widget for each datastream to the Web Dashboard. Enable **Save RAW Data** in the datastream settings to retain individual readings. If compartments 3 and 4 are enabled on the sensor node, set up **V2** and **V3** for them.
 2. On the gateway, copy [BlynkSecrets.example.h](arduino/BinGoGateway/BlynkSecrets.example.h) to `BlynkSecrets.h`, set `BLYNK_AUTH_TOKEN` to the BinGo device's token, and check that `BLYNK_SERVER` matches the region shown in Blynk.Console. The gateway connects through its existing Wi-Fi settings in `Secrets.h`. The Blynk HTTPS API uses the device token, so it needs no Blynk Arduino library.
 3. Upload the gateway sketch first, then the sensor node sketch. The node sends the measured clearance in cm over UART every 30 seconds. To trigger a reading immediately, enter `f` in the sensor node's Serial Monitor. Look for `BLYNK OK HTTP 200` in the gateway's Serial Monitor, then move a target beneath a sensor and confirm that the corresponding dashboard value changes. Distances work before fill percentage calibration. A missed echo leaves that compartment's last valid value in Blynk.
+4. For the BH1750 on the gateway, set up **Ambient Light** as a Virtual Pin datastream on **V4** with type **Double**, unit **lux**, and range **0–55000**. Bind the dashboard widget to V4. The gateway sends a valid light reading about every 30 seconds and logs `BLYNK V4 OK HTTP 200` after a successful upload.
 
 **If Blynk shows Offline while readings update:** The gateway sends each batch in a short HTTPS request and closes the connection after the upload. To make the status reflect recent readings, open **Blynk.Console → Developer Zone → My Templates → BinGo → Connection Lifecycle** and enable **Log when device reports any data**. Set the **Wait Period** to **90 seconds** to allow for delayed readings. Blynk shows the device as Online when it receives data and marks it Offline if no new data arrives within the wait period. [Blynk Connection Lifecycle](https://docs.blynk.io/en/blynk.console/templates/connection-lifecycle)
 
@@ -133,7 +145,7 @@ Use a bidirectional I²C level shifter for a 5 V backpack. If the LCD and backpa
 
 1. In Arduino IDE Library Manager, install `LiquidCrystal_I2C` by Martin Kubovčík and Frank de Brabander (version 2.0.0).
 2. Upload `BinGoGateway.ino` and open the gateway Serial Monitor at `115200`. It should report `LCD READY` with the detected address. The LCD shows `Bingo` centered above `Ready`.
-3. Send `c` to the sensor node. The second row shows `Classifying...` followed by the class name with the highest confidence, up to 16 characters. It shows `No prediction` if no valid class is available, or `API error` if the request fails.
+3. Send `c` to the sensor node. The second row shows `Classifying...` followed by the class name with the highest confidence, up to 16 characters. It shows `No prediction` if no valid class is available, or `API error` if the request fails. After five seconds, the display returns to `Ready`.
 
 If the screen is blank after `LCD READY`, adjust the contrast screw on the backpack. If the gateway reports `LCD ERR no device at 0x27 or 0x3F`, check the wiring and confirm the backpack address with an I²C scanner.
 
