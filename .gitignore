@@ -1,0 +1,3 @@
+.DS_Store
+/arduino/BinGoGateway/Secrets.h
+/arduino/*/OtaSecrets.h
