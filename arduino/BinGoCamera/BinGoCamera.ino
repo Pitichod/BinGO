@@ -1,19 +1,7 @@
-#include <Arduino.h>
-#include <ArduinoOTA.h>
-#include <WiFi.h>
+#include "../BinGoCommon.h"
 #include <esp_camera.h>
 #include <esp_rom_crc.h>
 
-#if __has_include("OtaSecrets.h")
-#include "OtaSecrets.h"
-#else
-constexpr char kOtaWifiSsid[] = "";
-constexpr char kOtaWifiPassword[] = "";
-constexpr char kOtaPassword[] = "";
-#endif
-
-constexpr unsigned long kBaud = 115200;
-constexpr size_t kMaxJpegBytes = 64 * 1024;
 constexpr int kNodeRxPin = 14;
 constexpr int kNodeTxPin = 13;
 constexpr int kFlashPin = 4;
@@ -29,22 +17,12 @@ void setup() {
 
   // AI-Thinker ESP32-CAM camera connector. Leave microSD disabled.
   camera_config_t config = {};
-  config.pin_pwdn = 32;
-  config.pin_reset = -1;
-  config.pin_xclk = 0;
-  config.pin_sccb_sda = 26;
-  config.pin_sccb_scl = 27;
-  config.pin_d7 = 35;
-  config.pin_d6 = 34;
-  config.pin_d5 = 39;
-  config.pin_d4 = 36;
-  config.pin_d3 = 21;
-  config.pin_d2 = 19;
-  config.pin_d1 = 18;
-  config.pin_d0 = 5;
-  config.pin_vsync = 25;
-  config.pin_href = 23;
-  config.pin_pclk = 22;
+  config.pin_pwdn = 32;   config.pin_reset = -1;
+  config.pin_xclk = 0;    config.pin_sccb_sda = 26;  config.pin_sccb_scl = 27;
+  config.pin_d7 = 35;     config.pin_d6 = 34;        config.pin_d5 = 39;
+  config.pin_d4 = 36;     config.pin_d3 = 21;        config.pin_d2 = 19;
+  config.pin_d1 = 18;     config.pin_d0 = 5;
+  config.pin_vsync = 25;  config.pin_href = 23;      config.pin_pclk = 22;
   config.xclk_freq_hz = 20000000;
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -55,33 +33,14 @@ void setup() {
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  esp_err_t result = esp_camera_init(&config);
-  cameraReady = result == ESP_OK;
-  if (cameraReady) {
-    Serial.println("CAM READY");
-  } else {
-    Serial.printf("Camera init failed (0x%x)\n", static_cast<unsigned int>(result));
-  }
+  cameraReady = esp_camera_init(&config) == ESP_OK;
+  Serial.println(cameraReady ? "CAM READY" : "Camera init failed");
 
-  if (kOtaWifiSsid[0] != '\0' && kOtaPassword[0] != '\0') {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(kOtaWifiSsid, kOtaWifiPassword);
-  }
+  beginOtaWifi();
 }
 
 void loop() {
-  if (!otaStarted && kOtaPassword[0] != '\0' && WiFi.status() == WL_CONNECTED) {
-    ArduinoOTA.setHostname("bingo-camera");
-    ArduinoOTA.setPassword(kOtaPassword);
-    ArduinoOTA.begin();
-    otaStarted = true;
-    Serial.print("OTA READY bingo-camera at ");
-    Serial.println(WiFi.localIP());
-  }
-  if (otaStarted) {
-    ArduinoOTA.handle();
-  }
+  handleOta(otaStarted, "bingo-camera");
 
   if (Serial1.read() != 'C') {
     delay(1);

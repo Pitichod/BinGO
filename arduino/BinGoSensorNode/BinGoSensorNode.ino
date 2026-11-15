@@ -1,19 +1,7 @@
-#include <Arduino.h>
-#include <ArduinoOTA.h>
-#include <WiFi.h>
+#include "../BinGoCommon.h"
 #include <algorithm>
 #include <esp_rom_crc.h>
 
-#if __has_include("OtaSecrets.h")
-#include "OtaSecrets.h"
-#else
-constexpr char kOtaWifiSsid[] = "";
-constexpr char kOtaWifiPassword[] = "";
-constexpr char kOtaPassword[] = "";
-#endif
-
-constexpr unsigned long kBaud = 115200;
-constexpr size_t kMaxJpegBytes = 64 * 1024;
 constexpr int kCameraRxPin = 27;
 constexpr int kCameraTxPin = 26;
 constexpr int kGatewayRxPin = 33;
@@ -60,11 +48,7 @@ void setup() {
   }
   Serial.println("NODE READY. Enter p to ping gateway, c to capture, or f to measure bin room.");
 
-  if (kOtaWifiSsid[0] != '\0' && kOtaPassword[0] != '\0') {
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(kOtaWifiSsid, kOtaWifiPassword);
-  }
+  beginOtaWifi();
 }
 
 float measureBinDistance(int trigPin, int echoPin) {
@@ -72,20 +56,18 @@ float measureBinDistance(int trigPin, int echoPin) {
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
   const unsigned long echoUs = pulseIn(echoPin, HIGH, kEchoTimeoutUs);
-  // Give echoes time to die out before triggering this or another sensor.
   delay(kPingSpacingMs);
   return echoUs / 58.0f;
 }
 
 void reportBinRoom() {
   lastDistanceReportMs = millis();
-  // Keep four UART fields; zero marks an unavailable or disabled sensor.
   float distancesCm[4] = {};
   for (size_t i = 0; i < kBinCount; ++i) {
     const BinSensor &bin = kBins[i];
     float samples[3];
     size_t valid = 0;
-    for (size_t j = 0; j < sizeof(samples) / sizeof(samples[0]); ++j) {
+    for (size_t j = 0; j < 3; ++j) {
       const float cm = measureBinDistance(bin.trigPin, bin.echoPin);
       if (cm >= kMinDistanceCm && cm <= kMaxDistanceCm) {
         samples[valid++] = cm;
@@ -104,19 +86,28 @@ void reportBinRoom() {
     if (bin.fullCm < kMinDistanceCm || bin.emptyCm > kMaxDistanceCm ||
         bin.emptyCm <= bin.fullCm) {
       Serial.printf("%.1f cm clearance (calibration needed)\n", distanceCm);
-      continue;
+    } else {
+      const float remaining = 100.0f * (distanceCm - bin.fullCm) / (bin.emptyCm - bin.fullCm);
+      Serial.printf("%.0f%% room left (%.1f cm clearance)\n",
+                    constrain(remaining, 0.0f, 100.0f), distanceCm);
     }
-
-    const float remaining = 100.0f * (distanceCm - bin.fullCm) / (bin.emptyCm - bin.fullCm);
-    Serial.printf("%.0f%% room left (%.1f cm clearance)\n",
-                  constrain(remaining, 0.0f, 100.0f), distanceCm);
   }
   Serial2.printf("DIST %.2f %.2f %.2f %.2f\n",
                  distancesCm[0], distancesCm[1], distancesCm[2], distancesCm[3]);
 }
 
+// Reads the gateway's UART reply, skipping a stray CAPTURE that may have crossed.
+String readGatewayReply() {
+  String reply = Serial2.readStringUntil('\n');
+  reply.trim();
+  if (reply == "CAPTURE") {
+    reply = Serial2.readStringUntil('\n');
+    reply.trim();
+  }
+  return reply;
+}
+
 bool captureAndForward() {
-  // Drop unread data left by an interrupted capture before requesting another.
   while (Serial1.available()) {
     Serial1.read();
   }
@@ -146,15 +137,9 @@ bool captureAndForward() {
   Serial2.printf("ITEM %u %08lx %u\n", imageSize, expectedCrc, kTestWeightGrams);
   Serial2.write(jpeg, imageSize);
   Serial2.flush();
-  // Allow the gateway to report its own timeout if bytes were lost.
+
   Serial2.setTimeout(9000);
-  String reply = Serial2.readStringUntil('\n');
-  reply.trim();
-  // A Blynk request may have crossed an already-started USB capture.
-  if (reply == "CAPTURE") {
-    reply = Serial2.readStringUntil('\n');
-    reply.trim();
-  }
+  String reply = readGatewayReply();
   Serial.println(reply.isEmpty() ? "GATEWAY TIMEOUT" : reply.c_str());
   if (reply == "GATEWAY OK") {
     Serial2.setTimeout(75000);
@@ -173,17 +158,7 @@ void captureFromGateway() {
 }
 
 void loop() {
-  if (!otaStarted && kOtaPassword[0] != '\0' && WiFi.status() == WL_CONNECTED) {
-    ArduinoOTA.setHostname("bingo-sensor-node");
-    ArduinoOTA.setPassword(kOtaPassword);
-    ArduinoOTA.begin();
-    otaStarted = true;
-    Serial.print("OTA READY bingo-sensor-node at ");
-    Serial.println(WiFi.localIP());
-  }
-  if (otaStarted) {
-    ArduinoOTA.handle();
-  }
+  handleOta(otaStarted, "bingo-sensor-node");
 
   if (Serial2.available()) {
     String command = Serial2.readStringUntil('\n');
@@ -199,13 +174,13 @@ void loop() {
       Serial2.println("PING");
       String reply = Serial2.readStringUntil('\n');
       reply.trim();
-      const bool captureRequested = reply == "CAPTURE";
-      if (captureRequested) {
+      const bool captureReq = reply == "CAPTURE";
+      if (captureReq) {
         reply = Serial2.readStringUntil('\n');
         reply.trim();
       }
       Serial.println(reply.isEmpty() ? "GATEWAY TIMEOUT" : reply.c_str());
-      if (captureRequested) {
+      if (captureReq) {
         captureFromGateway();
       }
       break;
