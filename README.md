@@ -14,6 +14,9 @@ flowchart LR
     gateway -->|Upload JPEG| ai[Ultralytics classification API]
     ai -->|Predicted waste class| gateway
     gateway -->|Compartment distances over HTTPS| dashboard[Blynk dashboard]
+    dashboard -->|Capture button| gateway
+    gateway -->|Capture request over UART| node
+    gateway -->|Classification and latest photo URL| dashboard
     gatewaySensors[Load cell + HX711, DHT11, light sensor] -.->|Planned gateway sensors| gateway
     gateway -.->|Planned AI-controlled sorting| servos[Two-servo sorting mechanism]
     servos -->|Rotate, then tilt| bin[Selected bin compartment]
@@ -28,7 +31,7 @@ flowchart LR
 
 **Camera milestone:** Send one capture trigger from the sensor node and verify that it receives one complete, viewable JPEG from the ESP32-CAM.
 
-The current prototype uses the serial command `c` to trigger the camera and displays the AI classification on the gateway LCD. Once the hardware arrives, the gateway will use the predicted class to select a compartment and then command the two servos. The mechanism will need a safe stop, such as a timeout or a manual stop, for testing and demonstration.
+The prototype can trigger the camera from Blynk or with the serial command `c`. The AI classification appears on the gateway LCD and on the configured Blynk dashboard. Once the hardware arrives, the gateway will use the predicted class to select a compartment and then command the two servos. The mechanism will need a safe stop, such as a timeout or a manual stop, for testing and demonstration.
 
 ## Sensor allocation
 
@@ -82,11 +85,37 @@ Room left is an estimate of remaining **height** between the calibrated empty an
 ## Blynk dashboard
 
 1. In the **BinGo** template in Blynk.Console, use **Virtual Pin** datastreams **V0** for compartment 1 and **V1** for compartment 2. Check that both use type **Double**, unit **cm**, and range **2–400**. Add a value widget for each datastream to the Web Dashboard. Enable **Save RAW Data** in the datastream settings to retain individual readings. If compartments 3 and 4 are enabled on the sensor node, set up **V2** and **V3** for them.
-2. On the gateway, copy [BlynkSecrets.example.h](arduino/BinGoGateway/BlynkSecrets.example.h) to `BlynkSecrets.h`, set `BLYNK_AUTH_TOKEN` to the BinGo device's token, and check that `BLYNK_SERVER` matches the region shown in Blynk.Console. The gateway connects through its existing Wi-Fi settings in `Secrets.h`. The Blynk HTTPS API uses the device token, so it needs no Blynk Arduino library.
+2. On the gateway, copy [BlynkSecrets.example.h](arduino/BinGoGateway/BlynkSecrets.example.h) to `BlynkSecrets.h`, set `BLYNK_AUTH_TOKEN` to the BinGo device's token, and check that `BLYNK_SERVER` matches the region shown in Blynk.Console. The gateway connects through its existing Wi-Fi settings in `Secrets.h`. Readings use the Blynk HTTPS API. Install the Blynk Arduino library if you enable dashboard capture.
 3. Upload the gateway sketch first, then the sensor node sketch. The node sends the measured clearance in cm over UART every 30 seconds. To trigger a reading immediately, enter `f` in the sensor node's Serial Monitor. Look for `BLYNK OK HTTP 200` in the gateway's Serial Monitor, then move a target beneath a sensor and confirm that the corresponding dashboard value changes. Distances work before fill percentage calibration. A missed echo leaves that compartment's last valid value in Blynk.
 4. For the BH1750 on the gateway, set up **Ambient Light** as a Virtual Pin datastream on **V4** with type **Double**, unit **lux**, and range **0–55000**. Bind the dashboard widget to V4. The gateway sends a valid light reading about every 30 seconds and logs `BLYNK V4 OK HTTP 200` after a successful upload.
 
-**If Blynk shows Offline while readings update:** The gateway sends each batch in a short HTTPS request and closes the connection after the upload. To make the status reflect recent readings, open **Blynk.Console → Developer Zone → My Templates → BinGo → Connection Lifecycle** and enable **Log when device reports any data**. Set the **Wait Period** to **90 seconds** to allow for delayed readings. Blynk shows the device as Online when it receives data and marks it Offline if no new data arrives within the wait period. [Blynk Connection Lifecycle](https://docs.blynk.io/en/blynk.console/templates/connection-lifecycle)
+**If Blynk shows Offline in a readings-only setup:** The gateway sends each batch in a short HTTPS request and closes the connection after the upload. To make the status reflect recent readings, open **Blynk.Console → Developer Zone → My Templates → BinGo → Connection Lifecycle** and enable **Log when device reports any data**. Set the **Wait Period** to **90 seconds** to allow for delayed readings. Blynk shows the device as Online when it receives data and marks it Offline if no new data arrives within the wait period. [Blynk Connection Lifecycle](https://docs.blynk.io/en/blynk.console/templates/connection-lifecycle)
+
+### Capture and classify from Blynk Free
+
+In the **BinGo** template, add these Virtual Pin datastreams and bind them to widgets on the device dashboard.
+
+| Pin | Datastream | Dashboard widget |
+| --- | --- | --- |
+| V5 | **Capture Photo**, Integer, 0–1, default 0 | **Image Button** in **Push** mode on the web, or **Button** in **Push** mode in the mobile app |
+| V6 | **Latest Classification**, String | **Label** (Web Dashboard) or **Labeled Value** (mobile app) |
+| V7 | **Latest Photo**, Integer, 0–1, default 0 | **Image Gallery**, with the photo URL in the first slot |
+
+Leave **Sync with latest server value** off on V5 so the device starts with a released button. Enable it on V6 to keep the latest result visible across reconnects. Save and apply the template, then open the BinGo device's live dashboard.
+
+1. Install **Blynk** from Arduino IDE's Library Manager. Add `BLYNK_TEMPLATE_ID` and `BLYNK_TEMPLATE_NAME` from Blynk.Console to the gateway's existing `BlynkSecrets.h`. The gateway uses its existing token and joins Wi-Fi as before.
+2. To enable the photo, set `BLYNK_PHOTO_URL` to the full HTTPS URL for `/latest.jpg`, with no query string. Configure an HTTPS reverse proxy from this URL to `http://<gateway-IP>/latest.jpg` and enter the same HTTPS URL in the Image Gallery. Your dashboard must be able to load the URL.
+3. Upload the gateway and sensor node sketches. Put an item in front of the camera and tap **Capture Photo** once. The gateway requests the same capture as `c`, classifies the JPEG through Ultralytics, and updates the photo and the class with its confidence. Tap again after the result to test a new item.
+
+The gateway serves the JPEG directly from its existing RAM buffer and sends Blynk a new URL revision to refresh the widget. Each valid capture replaces the previous frame. Restarting the gateway clears the photo. The gateway returns HTTP 404 before the first valid capture or if a JPEG transfer overwrites the buffer and fails validation. The capture button and classification label can also be used with `BLYNK_PHOTO_URL` omitted. [Blynk Image Gallery](https://docs.blynk.io/en/blynk.apps/widgets-displays/image-gallery)
+
+For a local Web Dashboard test, you can run an HTTPS proxy on the computer that opens Blynk. With Caddy installed and its local CA trusted by that computer, replace `192.168.1.50` with the gateway's LAN IP.
+
+```sh
+caddy reverse-proxy --from https://localhost:8443 --to http://192.168.1.50 --internal-certs --disable-redirects
+```
+
+Use `https://localhost:8443/latest.jpg` for `BLYNK_PHOTO_URL` and V7. Leave the proxy running and open the Web Dashboard on that same computer. After a capture, open the HTTPS photo URL directly to check that it loads with a trusted certificate. A dashboard viewed on a different device needs an HTTPS URL reachable from that device. [Caddy local HTTPS](https://caddyserver.com/docs/automatic-https#local-https)
 
 ## ทดสอบกล้อง แฟลช และ Ultralytics API ใน Arduino IDE
 
@@ -128,6 +157,15 @@ Room left is an estimate of remaining **height** between the calibrated empty an
 2. ให้บอร์ดมีไฟเลี้ยงและให้คอมอยู่บนเครือข่ายเดียวกัน บอร์ดจะแสดง `OTA READY` พร้อมชื่อและ IP ใน Serial Monitor หลังเชื่อมต่อ Wi-Fi
 3. เปิด sketch ของบอร์ดที่จะอัปเดต เลือก **Tools → Port → Network Ports** แล้วเลือกชื่อตามตาราง กด **Upload** และกรอกค่า `kOtaPassword` ของบอร์ดนั้น ใช้ Partition Scheme เดิมทุกครั้ง
 4. เริ่มอัปโหลดช่วงที่ระบบว่างจากการถ่ายภาพและเรียก API เมื่ออัปโหลดสำเร็จบอร์ดจะรีสตาร์ตและแสดงพอร์ตเครือข่ายอีกครั้ง
+
+## ทดสอบมุมถาดด้วย MPU-6050
+
+ยึดโมดูลกับถาดโดยให้หน้าบอร์ดหงายขึ้นตอนถาดราบ ต่อ `SDA → GPIO23`, `SCL → GPIO27`, `GND → GND` และใช้ `3V3` กับ `VCC` หากโมดูลรองรับไฟเลี้ยง 3.3 V สาย SDA และ SCL ต้องมี pull-up ไปที่ 3.3 V ถ้าโมดูลมี pull-up บนบอร์ดอยู่แล้ว ใช้ของบนโมดูลได้
+
+1. ตั้ง `kMpuDiagnosticMode = true` ใน `BinGoGateway.ino` แล้วอัปโหลดไปยัง ESP32 Gateway ผ่าน USB โหมดนี้พัก LCD, BH1750, UART ไปยัง sensor node, Blynk และ OTA
+2. ปิด Arduino Serial Monitor แล้วเปิด macOS Terminal ใช้ `ls /dev/cu.*` หา USB port ของ Gateway และเปิดด้วย `screen /dev/cu.usbserial-0001 115200` โดยเปลี่ยนชื่อพอร์ตให้ตรงกับบอร์ด
+3. วางถาดราบและนิ่งตอนเปิดบอร์ดหรือกด `EN` เพื่อวัดค่าไจโรขณะหยุดนิ่ง หน้าจอจะอัปเดตรูปด้านหน้า ด้านข้าง และด้านบนประมาณ 10 ครั้งต่อวินาที กด `Z` ตอนถาดราบเพื่อตั้งมุมหมุนเป็นศูนย์ มุมหมุนเป็นค่าจากจุดอ้างอิงและจะสะสมความคลาดเคลื่อน หากเอียงเกิน 15° ให้กลับมาราบแล้วกด `Z` อีกครั้ง
+4. ออกจาก `screen` ด้วย `Ctrl+A` แล้วกด `k` ตามด้วย `y` เมื่อต้องการกลับไปใช้ Gateway ปกติ ให้ตั้ง `kMpuDiagnosticMode = false` และอัปโหลดผ่าน USB อีกครั้ง
 
 ## Gateway LCD1602 wiring
 

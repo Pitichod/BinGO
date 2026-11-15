@@ -115,7 +115,7 @@ void reportBinRoom() {
                  distancesCm[0], distancesCm[1], distancesCm[2], distancesCm[3]);
 }
 
-void captureAndForward() {
+bool captureAndForward() {
   // Drop unread data left by an interrupted capture before requesting another.
   while (Serial1.available()) {
     Serial1.read();
@@ -127,18 +127,18 @@ void captureAndForward() {
   if (sscanf(header.c_str(), "JPEG %u %lx", &imageSize, &expectedCrc) != 2 ||
       imageSize < 4 || imageSize > sizeof(jpeg)) {
     Serial.printf("CAM HEADER ERROR [%s]\n", header.c_str());
-    return;
+    return false;
   }
 
   size_t received = Serial1.readBytes(jpeg, imageSize);
   if (received != imageSize) {
     Serial.printf("CAM TIMEOUT %u/%u bytes\n", static_cast<unsigned int>(received),
                   imageSize);
-    return;
+    return false;
   }
   if (esp_rom_crc32_le(0, jpeg, imageSize) != expectedCrc) {
     Serial.println("CAM CRC ERROR");
-    return;
+    return false;
   }
 
   Serial.printf("CAM OK %u bytes. Forwarding with test weight %u g.\n",
@@ -150,6 +150,11 @@ void captureAndForward() {
   Serial2.setTimeout(9000);
   String reply = Serial2.readStringUntil('\n');
   reply.trim();
+  // A Blynk request may have crossed an already-started USB capture.
+  if (reply == "CAPTURE") {
+    reply = Serial2.readStringUntil('\n');
+    reply.trim();
+  }
   Serial.println(reply.isEmpty() ? "GATEWAY TIMEOUT" : reply.c_str());
   if (reply == "GATEWAY OK") {
     Serial2.setTimeout(75000);
@@ -158,6 +163,13 @@ void captureAndForward() {
     Serial.println(apiReply.isEmpty() ? "API TIMEOUT" : apiReply.c_str());
   }
   Serial2.setTimeout(2000);
+  return true;
+}
+
+void captureFromGateway() {
+  if (!captureAndForward()) {
+    Serial2.println("CAPTURE ERR");
+  }
 }
 
 void loop() {
@@ -173,12 +185,29 @@ void loop() {
     ArduinoOTA.handle();
   }
 
+  if (Serial2.available()) {
+    String command = Serial2.readStringUntil('\n');
+    command.trim();
+    if (command == "CAPTURE") {
+      captureFromGateway();
+      return;
+    }
+  }
+
   switch (Serial.read()) {
     case 'p': {
       Serial2.println("PING");
       String reply = Serial2.readStringUntil('\n');
       reply.trim();
+      const bool captureRequested = reply == "CAPTURE";
+      if (captureRequested) {
+        reply = Serial2.readStringUntil('\n');
+        reply.trim();
+      }
       Serial.println(reply.isEmpty() ? "GATEWAY TIMEOUT" : reply.c_str());
+      if (captureRequested) {
+        captureFromGateway();
+      }
       break;
     }
     case 'c':

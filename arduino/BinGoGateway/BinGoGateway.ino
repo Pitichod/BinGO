@@ -3,6 +3,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <atomic>
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
@@ -10,6 +11,8 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <time.h>
+
+#include "Mpu6050Diagnostic.h"
 
 #if __has_include("Secrets.h")
 #include "Secrets.h"
@@ -23,6 +26,15 @@
 #include "BlynkSecrets.example.h"
 #endif
 
+#if defined(BLYNK_TEMPLATE_ID) && defined(BLYNK_TEMPLATE_NAME)
+#define BINGO_BLYNK_CAMERA_CONTROL
+#include <BlynkSimpleEsp32_SSL.h>
+#endif
+
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+#include <WebServer.h>
+#endif
+
 #if __has_include("OtaSecrets.h")
 #include "OtaSecrets.h"
 #else
@@ -30,6 +42,7 @@ constexpr char kOtaPassword[] = "";
 #endif
 
 constexpr unsigned long kBaud = 115200;
+constexpr bool kMpuDiagnosticMode = false;
 constexpr size_t kMaxJpegBytes = 64 * 1024;
 constexpr size_t kMaxResponseBytes = 8 * 1024;
 constexpr int kNodeRxPin = 33;
@@ -46,6 +59,7 @@ constexpr uint8_t kBh1750Address = 0x23;  // ADDR low
 constexpr uint8_t kBh1750ContinuousHighResolution = 0x10;
 constexpr unsigned long kLightReadIntervalMs = 1000;
 constexpr unsigned long kLightPublishIntervalMs = 30000;
+constexpr unsigned long kCaptureTimeoutMs = 25000;
 
 constexpr char kMultipartHead[] =
     "--BinGoPhotoBoundary\r\n"
@@ -76,6 +90,42 @@ QueueHandle_t blynkDistances = nullptr;
 QueueHandle_t blynkLightReadings = nullptr;
 TaskHandle_t blynkPublisher = nullptr;
 SemaphoreHandle_t cloudRequest = nullptr;
+std::atomic<bool> captureRequested{false};
+bool waitingForCapture = false;
+unsigned long captureStartedAtMs = 0;
+
+struct CaptureUpdate {
+  char classification[128] = "No valid classification";
+  unsigned long photoRevision = 0;
+};
+
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+QueueHandle_t blynkCaptureUpdates = nullptr;
+// Accessed only while holding cloudRequest.
+bool reconnectBlynk = false;
+
+BLYNK_WRITE(V5) {
+  if (param.asInt() == 1) {
+    captureRequested = true;
+  }
+}
+#endif
+
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+static_assert(sizeof(BLYNK_PHOTO_URL) + sizeof("?v=4294967295") <= 256,
+              "BLYNK_PHOTO_URL is too long for Blynk Image Gallery");
+WebServer photoServer(80);
+size_t latestPhotoBytes = 0;
+
+void serveLatestPhoto() {
+  photoServer.sendHeader("Cache-Control", "no-store");
+  if (latestPhotoBytes == 0) {
+    photoServer.send(404, "text/plain", "Capture a photo first");
+    return;
+  }
+  photoServer.send_P(200, "image/jpeg", reinterpret_cast<const char *>(jpeg), latestPhotoBytes);
+}
+#endif
 
 void startClockSync() {
   static bool started = false;
@@ -146,8 +196,38 @@ void sendDistancesToBlynk(const BinDistances &distances) {
 }
 
 void publishBlynkReadings(void *) {
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+  CaptureUpdate update = {};
+  bool updatePending = false;
+#endif
   for (;;) {
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+    if (xQueueReceive(blynkCaptureUpdates, &update, 0) == pdTRUE) {
+      updatePending = true;
+    }
+    if (WiFi.status() == WL_CONNECTED && time(nullptr) >= kEarliestTlsTime &&
+        xSemaphoreTake(cloudRequest, 0) == pdTRUE) {
+      if (reconnectBlynk) {
+        reconnectBlynk = false;
+        Blynk.connect(100);
+      } else {
+        Blynk.run();
+      }
+      if (updatePending && Blynk.connected()) {
+#ifdef BLYNK_PHOTO_URL
+        char url[256];
+        snprintf(url, sizeof(url), "%s?v=%lu", BLYNK_PHOTO_URL, update.photoRevision);
+        Blynk.setProperty(V7, "urls", url);
+#endif
+        Blynk.virtualWrite(V6, update.classification);
+        updatePending = !Blynk.connected();
+      }
+      xSemaphoreGive(cloudRequest);
+    }
+#else
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+#endif
     BinDistances distances;
     if (xQueueReceive(blynkDistances, &distances, 0) == pdTRUE) {
       sendDistancesToBlynk(distances);
@@ -175,6 +255,20 @@ void showGatewayStatus(const char *status) {
   snprintf(row, sizeof(row), "%-*.*s", kLcdColumns, kLcdColumns, status);
   gatewayLcd->setCursor(0, 1);
   gatewayLcd->print(row);
+}
+
+void finishCapture(const char *error) {
+  if (!waitingForCapture) {
+    return;
+  }
+  waitingForCapture = false;
+  captureRequested = false;
+  if (error != nullptr) {
+    Serial.println(error);
+    showGatewayStatus(error);
+    lcdResultShownAtMs = millis();
+    lcdResultVisible = true;
+  }
 }
 
 void setupGatewayLcd() {
@@ -248,7 +342,8 @@ struct ApiResponse {
   bool omitted = false;
 };
 
-String summarizePrediction(const String &body, char *lcdClassName) {
+String summarizePrediction(const String &body, char *lcdClassName, char *classification,
+                           size_t classificationSize) {
   cJSON *root = cJSON_ParseWithOpts(body.c_str(), nullptr, true);
   const cJSON *images = cJSON_GetObjectItemCaseSensitive(root, "images");
   const cJSON *image = cJSON_GetArrayItem(images, 0);
@@ -289,6 +384,8 @@ String summarizePrediction(const String &body, char *lcdClassName) {
     }
     snprintf(summary, sizeof(summary), "class=%d name=%.63s confidence=%.5f",
              bestClass, bestName, bestConfidence);
+    snprintf(classification, classificationSize, "%.63s (%.1f%%)", bestName,
+             bestConfidence * 100);
   }
   cJSON_Delete(root);
   String line(summary);
@@ -312,7 +409,8 @@ esp_err_t printApiResponse(esp_http_client_event_t *event) {
   return ESP_OK;
 }
 
-String predictWaste(size_t imageSize, char *lcdClassName) {
+String predictWaste(size_t imageSize, char *lcdClassName, char *classification,
+                    size_t classificationSize) {
   if (kWifiSsid[0] == '\0' || kUltralyticsApiKey[0] == '\0' ||
       strstr(kUltralyticsPredictUrl, "/OWNER/PROJECT/MODEL/") != nullptr) {
     return "API ERR configure Secrets.h";
@@ -389,7 +487,8 @@ String predictWaste(size_t imageSize, char *lcdClassName) {
   if (response.omitted) {
     reply += " | Response omitted (UART limit 8192 bytes or low memory)";
   } else if (!response.body.isEmpty()) {
-    String prediction = summarizePrediction(response.body, lcdClassName);
+    String prediction = summarizePrediction(response.body, lcdClassName, classification,
+                                            classificationSize);
     response.body.replace('\r', ' ');
     response.body.replace('\n', ' ');
     if (!reply.reserve(reply.length() + 6 + prediction.length() + response.body.length())) {
@@ -405,6 +504,11 @@ String predictWaste(size_t imageSize, char *lcdClassName) {
 
 void setup() {
   Serial.begin(kBaud);
+  if (kMpuDiagnosticMode) {
+    Mpu6050Diagnostic::begin();
+    return;
+  }
+
   Serial2.setRxBufferSize(4096);
   Serial2.begin(kBaud, SERIAL_8N1, kNodeRxPin, kNodeTxPin);
   Serial2.setTimeout(8000);
@@ -416,8 +520,20 @@ void setup() {
     cloudRequest = xSemaphoreCreateMutex();
     blynkDistances = xQueueCreate(1, sizeof(BinDistances));
     blynkLightReadings = xQueueCreate(1, sizeof(float));
-    if (cloudRequest == nullptr || blynkDistances == nullptr || blynkLightReadings == nullptr ||
+    bool queuesReady = blynkDistances != nullptr && blynkLightReadings != nullptr;
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+    blynkCaptureUpdates = xQueueCreate(1, sizeof(CaptureUpdate));
+    queuesReady = queuesReady && blynkCaptureUpdates != nullptr;
+    Blynk.config(BLYNK_AUTH_TOKEN, BLYNK_SERVER);
+#endif
+    if (cloudRequest == nullptr || !queuesReady ||
         xTaskCreate(publishBlynkReadings, "blynk", 8192, nullptr, 1, &blynkPublisher) != pdPASS) {
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+      if (blynkCaptureUpdates != nullptr) {
+        vQueueDelete(blynkCaptureUpdates);
+        blynkCaptureUpdates = nullptr;
+      }
+#endif
       if (blynkDistances != nullptr) {
         vQueueDelete(blynkDistances);
         blynkDistances = nullptr;
@@ -439,9 +555,18 @@ void setup() {
     WiFi.setAutoReconnect(true);
     WiFi.begin(kWifiSsid, kWifiPassword);
   }
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+  photoServer.on("/latest.jpg", HTTP_GET, serveLatestPhoto);
+  photoServer.begin();
+#endif
 }
 
 void loop() {
+  if (kMpuDiagnosticMode) {
+    Mpu6050Diagnostic::update();
+    return;
+  }
+
   if (lcdResultVisible && millis() - lcdResultShownAtMs >= kLcdResultDurationMs) {
     showGatewayStatus("Ready");
     lcdResultVisible = false;
@@ -463,6 +588,20 @@ void loop() {
   printLightLevel();
 
   if (!Serial2.available()) {
+    if (waitingForCapture && millis() - captureStartedAtMs >= kCaptureTimeoutMs) {
+      finishCapture("Capture timeout");
+    } else if (!waitingForCapture && captureRequested) {
+      waitingForCapture = true;
+      captureStartedAtMs = millis();
+      lcdResultVisible = false;
+      showGatewayStatus("Capturing...");
+      Serial2.println("CAPTURE");
+    }
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+    if (!waitingForCapture) {
+      photoServer.handleClient();
+    }
+#endif
     delay(1);
     return;
   }
@@ -471,6 +610,10 @@ void loop() {
   header.trim();
   if (header == "PING") {
     Serial2.println("PONG");
+    return;
+  }
+  if (header == "CAPTURE ERR") {
+    finishCapture("Camera error");
     return;
   }
 
@@ -502,31 +645,51 @@ void loop() {
   if (sscanf(header.c_str(), "ITEM %u %lx %u", &imageSize, &expectedCrc,
              &weightGrams) != 3 || imageSize < 4 || imageSize > kMaxJpegBytes) {
     Serial2.println("GATEWAY ERR header");
+    finishCapture("JPEG error");
     return;
   }
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+  // The photo server shares the existing JPEG buffer and runs on this same loop.
+  latestPhotoBytes = 0;
+#endif
   if (Serial2.readBytes(jpeg, imageSize) != imageSize) {
     Serial2.println("GATEWAY ERR incomplete_image");
+    finishCapture("JPEG error");
     return;
   }
   if (esp_rom_crc32_le(0, jpeg, imageSize) != expectedCrc) {
     Serial2.println("GATEWAY ERR crc");
+    finishCapture("JPEG error");
     return;
   }
   if (jpeg[0] != 0xff || jpeg[1] != 0xd8 ||
       jpeg[imageSize - 2] != 0xff || jpeg[imageSize - 1] != 0xd9) {
     Serial2.println("GATEWAY ERR jpeg_markers");
+    finishCapture("JPEG error");
     return;
   }
+#if defined(BINGO_BLYNK_CAMERA_CONTROL) && defined(BLYNK_PHOTO_URL)
+  latestPhotoBytes = imageSize;
+#endif
 
   Serial.printf("GATEWAY OK %u bytes, %u g, CRC %08lx\n",
                 imageSize, weightGrams, expectedCrc);
   Serial2.println("GATEWAY OK");
   showGatewayStatus("Classifying...");
   char lcdClassName[kLcdColumns + 1] = {};
+  CaptureUpdate update;
   if (cloudRequest != nullptr) {
     xSemaphoreTake(cloudRequest, portMAX_DELAY);
   }
-  String result = predictWaste(imageSize, lcdClassName);
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+  if (blynkPublisher != nullptr) {
+    // Release the Blynk TLS buffers before the prediction handshake.
+    Blynk.disconnect();
+    reconnectBlynk = true;
+  }
+#endif
+  String result = predictWaste(imageSize, lcdClassName, update.classification,
+                               sizeof(update.classification));
   if (cloudRequest != nullptr) {
     xSemaphoreGive(cloudRequest);
   }
@@ -536,7 +699,16 @@ void loop() {
     showGatewayStatus(lcdClassName[0] ? lcdClassName : "No prediction");
   } else {
     showGatewayStatus("API error");
+    snprintf(update.classification, sizeof(update.classification), "%s", result.c_str());
   }
+#ifdef BINGO_BLYNK_CAMERA_CONTROL
+  if (blynkPublisher != nullptr) {
+    update.photoRevision = millis();
+    xQueueOverwrite(blynkCaptureUpdates, &update);
+    xTaskNotifyGive(blynkPublisher);
+  }
+#endif
   lcdResultShownAtMs = millis();
   lcdResultVisible = true;
+  finishCapture(nullptr);
 }
