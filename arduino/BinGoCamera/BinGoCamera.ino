@@ -1,79 +1,99 @@
-#include "../BinGoCommon.h"
+#include <Arduino.h>
 #include <esp_camera.h>
 #include <esp_rom_crc.h>
 
-constexpr int kNodeRxPin = 14;
-constexpr int kNodeTxPin = 13;
-constexpr int kFlashPin = 4;
-
 bool cameraReady = false;
-bool otaStarted = false;
 
-void setup() {
-  Serial.begin(kBaud);
-  Serial1.begin(kBaud, SERIAL_8N1, kNodeRxPin, kNodeTxPin);
-  pinMode(kFlashPin, OUTPUT);
-  digitalWrite(kFlashPin, LOW);
-
-  // AI-Thinker ESP32-CAM camera connector. Leave microSD disabled.
+void initCamera() {
   camera_config_t config = {};
-  config.pin_pwdn = 32;   config.pin_reset = -1;
-  config.pin_xclk = 0;    config.pin_sccb_sda = 26;  config.pin_sccb_scl = 27;
-  config.pin_d7 = 35;     config.pin_d6 = 34;        config.pin_d5 = 39;
-  config.pin_d4 = 36;     config.pin_d3 = 21;        config.pin_d2 = 19;
-  config.pin_d1 = 18;     config.pin_d0 = 5;
-  config.pin_vsync = 25;  config.pin_href = 23;      config.pin_pclk = 22;
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+  config.pin_xclk = 0;
+  config.pin_sccb_sda = 26;
+  config.pin_sccb_scl = 27;
+  config.pin_d0 = 5;
+  config.pin_d1 = 18;
+  config.pin_d2 = 19;
+  config.pin_d3 = 21;
+  config.pin_d4 = 36;
+  config.pin_d5 = 39;
+  config.pin_d6 = 34;
+  config.pin_d7 = 35;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+  config.pin_pclk = 22;
   config.xclk_freq_hz = 20000000;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.ledc_channel = LEDC_CHANNEL_0;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 15;
+  config.frame_size = FRAMESIZE_VGA;
+  config.jpeg_quality = 16;
   config.fb_count = 1;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  const esp_err_t result = esp_camera_init(&config);
+  cameraReady = result == ESP_OK;
+  Serial.printf("Camera init: %s\n", esp_err_to_name(result));
+}
 
-  cameraReady = esp_camera_init(&config) == ESP_OK;
-  Serial.println(cameraReady ? "CAM READY" : "Camera init failed");
+void sendPhoto() {
+  camera_fb_t *frame = cameraReady ? esp_camera_fb_get() : nullptr;
+  if (!frame || frame->len < 4 || frame->len > 48 * 1024) {
+    Serial1.println("ERR");
+  } else {
+    const auto crc = esp_rom_crc32_le(0, frame->buf, frame->len);
+    Serial1.printf("JPEG %u %08lx\n", static_cast<unsigned>(frame->len),
+                   static_cast<unsigned long>(crc));
+    Serial1.write(frame->buf, frame->len);
+    Serial1.flush();
+  }
+  if (frame) esp_camera_fb_return(frame);
+}
 
-  beginOtaWifi();
+#if __has_include("OtaSecrets.h")
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include "OtaSecrets.h"
+
+constexpr char otaHostname[] = "bingo-camera";
+bool otaReady = false;
+#endif
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, 14, 13);
+  Serial.println("Camera UART ready");
+  initCamera();
+#if __has_include("OtaSecrets.h")
+  if (wifiSsid[0] && otaPassword[0]) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSsid, wifiPassword);
+    Serial.println("Connecting to Wi-Fi for OTA");
+  } else {
+    Serial.println("Set Wi-Fi SSID and OTA password in OtaSecrets.h");
+  }
+#else
+  Serial.println("Wi-Fi disabled: OtaSecrets.h missing");
+#endif
 }
 
 void loop() {
-  handleOta(otaStarted, "bingo-camera");
-
-  if (Serial1.read() != 'C') {
-    delay(1);
-    return;
+#if __has_include("OtaSecrets.h")
+  if (wifiSsid[0] && otaPassword[0] && WiFi.status() == WL_CONNECTED) {
+    if (!otaReady) {
+      ArduinoOTA.setHostname(otaHostname);
+      ArduinoOTA.setPassword(otaPassword);
+      ArduinoOTA.begin();
+      otaReady = true;
+      Serial.printf("OTA READY %s at ", otaHostname);
+      Serial.println(WiFi.localIP());
+    }
+    ArduinoOTA.handle();
   }
-  if (!cameraReady) {
-    Serial1.println("ERR camera_init");
-    return;
+#endif
+  const int command = Serial1.read();
+  if (command == '?') {
+    Serial1.write('C');
+    Serial.println("Ping received");
+  } else if (command == 'P') {
+    sendPhoto();
   }
-
-  digitalWrite(kFlashPin, HIGH);
-  delay(250);
-  // The queue can still hold a frame captured before the flash came on.
-  camera_fb_t *previousFrame = esp_camera_fb_get();
-  if (previousFrame != nullptr) {
-    esp_camera_fb_return(previousFrame);
-  }
-  camera_fb_t *frame = esp_camera_fb_get();
-  digitalWrite(kFlashPin, LOW);
-  if (frame == nullptr) {
-    Serial1.println("ERR capture");
-    return;
-  }
-
-  if (frame->format == PIXFORMAT_JPEG && frame->len >= 4 &&
-      frame->len <= kMaxJpegBytes) {
-    uint32_t crc = esp_rom_crc32_le(0, frame->buf, frame->len);
-    Serial1.printf("JPEG %u %08lx\n", static_cast<unsigned int>(frame->len),
-                   static_cast<unsigned long>(crc));
-    Serial1.write(frame->buf, frame->len);
-    Serial.printf("CAM SENT %u bytes\n", static_cast<unsigned int>(frame->len));
-  } else {
-    Serial1.println("ERR jpeg_format_or_size");
-  }
-  esp_camera_fb_return(frame);
 }
