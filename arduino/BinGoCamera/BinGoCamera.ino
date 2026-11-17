@@ -2,6 +2,7 @@
 #include <esp_camera.h>
 #include <esp_rom_crc.h>
 
+constexpr int flashPin = 4;
 bool cameraReady = false;
 
 void initCamera() {
@@ -34,7 +35,19 @@ void initCamera() {
 }
 
 void sendPhoto() {
-  camera_fb_t *frame = cameraReady ? esp_camera_fb_get() : nullptr;
+  camera_fb_t *frame = nullptr;
+  if (cameraReady) {
+    digitalWrite(flashPin, HIGH);
+    delay(150);
+
+    // Drop the frame that may have been queued before the flash turned on.
+    camera_fb_t *queuedFrame = esp_camera_fb_get();
+    if (queuedFrame) {
+      esp_camera_fb_return(queuedFrame);
+      frame = esp_camera_fb_get();
+    }
+    digitalWrite(flashPin, LOW);
+  }
   if (!frame || frame->len < 4 || frame->len > 48 * 1024) {
     Serial1.println("ERR");
   } else {
@@ -58,6 +71,8 @@ bool otaReady = false;
 
 void setup() {
   Serial.begin(115200);
+  pinMode(flashPin, OUTPUT);
+  digitalWrite(flashPin, LOW);
   Serial1.begin(115200, SERIAL_8N1, 14, 13);
   Serial.println("Camera UART ready");
   initCamera();
@@ -81,6 +96,17 @@ void loop() {
     if (!otaReady) {
       ArduinoOTA.setHostname(otaHostname);
       ArduinoOTA.setPassword(otaPassword);
+      ArduinoOTA.onStart([]() { Serial.println("OTA started"); });
+      ArduinoOTA.onEnd([]() { Serial.println("OTA complete"); });
+      ArduinoOTA.onError([](ota_error_t error) {
+        if (error == OTA_BEGIN_ERROR) {
+          Serial.println("OTA error: could not initialize update; check running partition scheme");
+        } else if (error == OTA_CONNECT_ERROR) {
+          Serial.println("OTA error: could not connect back to uploader over TCP");
+        } else {
+          Serial.printf("OTA error: %u\n", static_cast<unsigned>(error));
+        }
+      });
       ArduinoOTA.begin();
       otaReady = true;
       Serial.printf("OTA READY %s at ", otaHostname);
