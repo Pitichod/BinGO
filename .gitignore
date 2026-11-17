@@ -1,2 +1,3 @@
 /arduino/*/OtaSecrets.h
 /arduino/BinGoGateway/YoloSecrets.h
+/arduino/*/EspNowPeer.h
